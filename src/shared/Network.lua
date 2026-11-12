@@ -13,6 +13,7 @@ local REMOTE_EVENTS = {
 }
 local REMOTE_FUNCTIONS = {
     "GetData", "NextWeek", "ApplyChoice", "SubmitMiniGame",
+    "StartMiniGame", "FinishMiniGame",
 }
 
 local events, functions = {}, {}

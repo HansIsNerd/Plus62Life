@@ -1,6 +1,6 @@
 --!nonstrict
 -- src/client/DashboardUI.client.lua
--- Layout 3 kolom: Kiri (Profil + Stat) 25% | Tengah (Timeline) 45% | Kanan (Quick Info + NEXT WEEK) 30%.
+-- Layout 3 kolom: Kiri (Profil + Stat) 25% | Tengah (Timeline) 45% | Kanan (Quick Info + NEXT WEEK + Kerja) 30%.
 -- StatBar.lua, LogPanel.lua, dan InfoPanel.lua versi lama sudah tidak dipakai; boleh dihapus.
 
 local Players           = game:GetService("Players")
@@ -19,21 +19,39 @@ local Colors    = UIStyle.Colors
 local Fonts     = UIStyle.Fonts
 
 -- ===== Konstanta =====
-local GAP              = UIStyle.Gap
-local BUTTON_HEIGHT    = 64
-local TOPBAR_FALLBACK  = 58 -- tinggi topbar bawaan Roblox (logo, menu, chat, mic)
-local MAX_LOG_ROWS     = 100
-local BOTTOM_THRESHOLD = 24 -- px; dianggap "di bawah" kalau selisih <= ini
-local NEXT_TEXT        = "NEXT WEEK ▶"
-local PILL             = UDim.new(0.5, 0)
-local FILL_TWEEN       = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local HOVER_TWEEN      = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local GAP                = UIStyle.Gap
+local RIGHT_GAP          = 12 -- jarak antar elemen di kolom kanan (lebih rapat agar muat 2 tombol)
+local BUTTON_HEIGHT      = 64
+local WORK_BUTTON_HEIGHT = 56
+local TOPBAR_FALLBACK    = 58 -- tinggi topbar bawaan Roblox (logo, menu, chat, mic)
+local MAX_LOG_ROWS       = 100
+local BOTTOM_THRESHOLD   = 24 -- px; dianggap "di bawah" kalau selisih <= ini
+local NEXT_TEXT          = "NEXT WEEK ▶"
+local WORK_TEXT          = "Kerja: Narik Ojol 🛵"
+local PILL               = UDim.new(0.5, 0)
+local FILL_TWEEN         = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local HOVER_TWEEN        = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local camera = workspace.CurrentCamera
 while not camera do
 	task.wait()
 	camera = workspace.CurrentCamera
 end
+
+-- Bridge ke OjolRunner.client.lua (LocalScript tidak bisa di-require, jadi pakai BindableEvent lokal)
+local function GetBindable(name: string): BindableEvent
+	local existing = ReplicatedStorage:FindFirstChild(name)
+	if existing and existing:IsA("BindableEvent") then
+		return existing
+	end
+	local event = Instance.new("BindableEvent")
+	event.Name = name
+	event.Parent = ReplicatedStorage
+	return event
+end
+
+local miniGameOpen   = GetBindable("MiniGameOpen")
+local miniGameClosed = GetBindable("MiniGameClosed")
 
 -- Area atas yang dipakai tombol bawaan Roblox (IgnoreGuiInset = true membuat UI kita menimpanya).
 local function GetTopInset(): number
@@ -355,7 +373,7 @@ local function AddLogEntry(entry)
 	end
 end
 
--- ===== KOLOM KANAN: Quick Info (atas) + NEXT WEEK (bawah) =====
+-- ===== KOLOM KANAN: Quick Info (atas) + NEXT WEEK + Kerja (bawah) =====
 local rightColumn = UIStyle.CreateComponent("Frame", {
 	Name = "RightColumn",
 	BackgroundTransparency = 1,
@@ -366,14 +384,15 @@ local rightColumn = UIStyle.CreateComponent("Frame", {
 }, {
 	UIStyle.CreateComponent("UIListLayout", {
 		FillDirection = Enum.FillDirection.Vertical,
-		Padding = UDim.new(0, GAP),
+		Padding = UDim.new(0, RIGHT_GAP),
 		SortOrder = Enum.SortOrder.LayoutOrder,
 	}),
 })
 
 local infoWrapper, infoCard = UIStyle.CreateCard({
 	Name = "QuickInfoCard",
-	Size = UDim2.new(1, 0, 1, -(BUTTON_HEIGHT + GAP)),
+	-- sisa tinggi = 100% - (tombol Next + tombol Kerja + 2 gap)
+	Size = UDim2.new(1, 0, 1, -(BUTTON_HEIGHT + WORK_BUTTON_HEIGHT + RIGHT_GAP * 2)),
 	LayoutOrder = 1,
 	Parent = rightColumn,
 })
@@ -467,31 +486,70 @@ local nextButton = UIStyle.CreateComponent("TextButton", {
 	Parent = rightColumn,
 })
 
-local serverBusy = false -- dari GameStateChanged
-local localBusy = false  -- selama InvokeServer berjalan
-local hovering = false
+-- Tombol Kerja: pill hijau (teks gelap agar kontras), abu saat sibuk
+local workButton = UIStyle.CreateComponent("TextButton", {
+	Name = "WorkOjolButton",
+	Text = WORK_TEXT,
+	Font = Fonts.Bold,
+	TextSize = 16,
+	TextColor3 = Colors.TextDark,
+	BackgroundColor3 = Colors.Primary,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Size = UDim2.new(1, 0, 0, WORK_BUTTON_HEIGHT),
+	LayoutOrder = 3,
+	Corner = PILL,
+	Parent = rightColumn,
+})
 
-local function UpdateNextButton()
+local serverBusy = false -- dari GameStateChanged
+local localBusy = false  -- selama InvokeServer / mini-game berjalan
+local hovering = false
+local workHovering = false
+
+local function UpdateButtons()
 	local busy = serverBusy or localBusy
+
+	-- Next Week
 	nextButton.Active = not busy
 	nextButton.Text = if busy then "WAIT..." else NEXT_TEXT
-
-	local target = Colors.ButtonBlack
+	local nextTarget = Colors.ButtonBlack
 	if busy then
-		target = Colors.ButtonDisabled
+		nextTarget = Colors.ButtonDisabled
 	elseif hovering then
-		target = Colors.Info
+		nextTarget = Colors.Info
 	end
-	TweenService:Create(nextButton, HOVER_TWEEN, { BackgroundColor3 = target }):Play()
+	TweenService:Create(nextButton, HOVER_TWEEN, { BackgroundColor3 = nextTarget }):Play()
+
+	-- Kerja
+	workButton.Active = not busy
+	local workColor = Colors.Primary
+	local workText = Colors.TextDark
+	if busy then
+		workColor = Colors.ButtonDisabled
+		workText = Colors.TextLight
+	elseif workHovering then
+		workColor = Colors.Info
+		workText = Colors.TextLight
+	end
+	TweenService:Create(workButton, HOVER_TWEEN, { BackgroundColor3 = workColor, TextColor3 = workText }):Play()
 end
 
 nextButton.MouseEnter:Connect(function()
 	hovering = true
-	UpdateNextButton()
+	UpdateButtons()
 end)
 nextButton.MouseLeave:Connect(function()
 	hovering = false
-	UpdateNextButton()
+	UpdateButtons()
+end)
+workButton.MouseEnter:Connect(function()
+	workHovering = true
+	UpdateButtons()
+end)
+workButton.MouseLeave:Connect(function()
+	workHovering = false
+	UpdateButtons()
 end)
 
 -- ===== Responsive layout =====
@@ -565,7 +623,7 @@ end)
 
 Network:OnClientEvent("GameStateChanged", function(state)
 	serverBusy = (state ~= GameState.State.IDLE)
-	UpdateNextButton()
+	UpdateButtons()
 end)
 
 nextButton.Activated:Connect(function()
@@ -573,7 +631,7 @@ nextButton.Activated:Connect(function()
 		return
 	end
 	localBusy = true
-	UpdateNextButton()
+	UpdateButtons()
 
 	local ok, success, message = pcall(function()
 		return Network:InvokeServer("NextWeek")
@@ -589,7 +647,26 @@ nextButton.Activated:Connect(function()
 	RefreshProfile()
 
 	localBusy = false
-	UpdateNextButton()
+	UpdateButtons()
+end)
+
+-- Tombol Kerja -> minta OjolRunner membuka mini-game
+workButton.Activated:Connect(function()
+	if serverBusy or localBusy then
+		return
+	end
+	localBusy = true -- mengunci kedua tombol sampai mini-game ditutup
+	UpdateButtons()
+	miniGameOpen:Fire("Ojol")
+end)
+
+-- Mini-game ditutup (selesai normal atau gagal mulai)
+miniGameClosed.Event:Connect(function(errorMessage)
+	localBusy = false
+	UpdateButtons()
+	if errorMessage then
+		AddLogEntry({ Text = tostring(errorMessage), Type = "Bahaya", Icon = "⚠️" })
+	end
 end)
 
 -- Muat data awal
@@ -612,5 +689,5 @@ task.spawn(function()
 	end
 end)
 
-UpdateNextButton()
+UpdateButtons()
 screenGui.Parent = playerGui
