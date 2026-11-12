@@ -1,9 +1,16 @@
 --!nonstrict
 -- src/client/OjolRunner.client.lua
 -- Mini-game Narik Ojol: endless runner 3 jalur, 15 detik, Soft UI.
--- LocalScript tidak bisa di-require, jadi dashboard berkomunikasi lewat BindableEvent lokal:
+-- Dashboard berkomunikasi lewat BindableEvent lokal:
 --   "MiniGameOpen"   (Dashboard -> Runner) : arg gameType
 --   "MiniGameClosed" (Runner -> Dashboard) : arg errorMessage? (nil = selesai normal)
+--
+-- Catatan sinkronisasi dengan server (MiniGameModule):
+--   * Server menolak FinishMiniGame yang datang sebelum (Duration - toleransi).
+--     Jadi jika pemain tabrakan lebih awal, game langsung berhenti di layar,
+--     tetapi klaim ke server ditunda sampai durasi penuh berlalu.
+--   * Server menghitung Cash = skor * RewardPerScore (MaxScore 40).
+--     Tampilan skor = koin * 10, tetapi yang dikirim ke server = jumlah koin.
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -20,22 +27,23 @@ local Colors    = UIStyle.Colors
 local Fonts     = UIStyle.Fonts
 
 -- ===== Konstanta =====
-local GAME_TYPE       = "Ojol"
-local DURATION        = 15      -- detik (samakan dengan MiniGameModule.Duration)
-local LANE_COUNT      = 3
-local ENTITY_WIDTH    = 0.2     -- lebar entity = 20% lebar area game
-local FALL_SPEED      = 0.75    -- tinggi area per detik
-local SPAWN_INTERVAL  = 0.5     -- detik antar spawn (hanya 1 entity per spawn -> selalu ada jalur aman)
-local OBSTACLE_CHANCE = 0.45
-local HIT_PENALTY     = 2       -- skor berkurang saat nabrak
-local INVULN_TIME     = 1.0     -- detik kebal setelah nabrak
-local PLAYER_Y        = 0.86    -- posisi vertikal player (skala area)
-local LANE_LERP       = 18      -- kecepatan geser player antar jalur
-local RESULT_DELAY    = 1.8     -- detik menampilkan hasil sebelum UI ditutup
-local CONTROL_HEIGHT  = 56
-local HEADER_HEIGHT   = 64
-local PILL            = UDim.new(0.5, 0)
-local OBSTACLE_ICONS  = { "🚧", "🚐", "🕳️" }
+local GAME_TYPE        = "Ojol"
+local DURATION         = 15      -- detik (samakan dengan MiniGameModule.Duration)
+local LANE_COUNT       = 3
+local ENTITY_WIDTH     = 0.2     -- lebar entity = 20% lebar area game
+local BASE_FALL_SPEED  = 0.55    -- tinggi area per detik di awal
+local FALL_ACCEL       = 0.05    -- tambahan kecepatan per detik berjalan
+local MAX_FALL_SPEED   = 1.5
+local BASE_SPAWN       = 0.6     -- detik antar spawn di awal
+local MIN_SPAWN        = 0.32    -- batas interval spawn tercepat
+local OBSTACLE_CHANCE  = 0.45
+local COIN_POINTS      = 10      -- skor tampilan per koin
+local PLAYER_Y         = 0.86    -- posisi vertikal player (skala area)
+local LANE_LERP        = 18      -- kecepatan geser player antar jalur
+local RESULT_DELAY     = 1.8     -- detik menampilkan hasil sebelum UI ditutup
+local CONTROL_HEIGHT   = 56
+local HEADER_HEIGHT    = 64
+local PILL             = UDim.new(0.5, 0)
 
 -- ===== Bridge ke Dashboard =====
 local function GetBindable(name: string): BindableEvent
@@ -73,11 +81,11 @@ local function BuildUI()
 		DisplayOrder = 50,
 	})
 
-	-- Overlay semi-transparan (Active = true supaya klik tidak tembus ke dashboard)
+	-- Overlay hitam semi-transparan (Active = true supaya klik tidak tembus ke dashboard)
 	local overlay = UIStyle.CreateComponent("Frame", {
 		Name = "Overlay",
-		BackgroundColor3 = Colors.Shadow,
-		BackgroundTransparency = 0.45,
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.5,
 		BorderSizePixel = 0,
 		Active = true,
 		Size = UDim2.fromScale(1, 1),
@@ -100,6 +108,7 @@ local function BuildUI()
 		}),
 	})
 
+	-- Card utama (putih, radius 24)
 	local wrapper, card = UIStyle.CreateCard({
 		Name = "OjolCard",
 		Size = UDim2.fromScale(1, 1),
@@ -107,12 +116,12 @@ local function BuildUI()
 	})
 	wrapper.AnchorPoint = Vector2.new(0.5, 0.5)
 	wrapper.Position = UDim2.fromScale(0.5, 0.5)
-	UIStyle.CreateComponent("UISizeConstraint", { MaxSize = Vector2.new(440, 720) }).Parent = wrapper
+	UIStyle.CreateComponent("UISizeConstraint", { MaxSize = Vector2.new(460, 700) }).Parent = wrapper
 
-	-- Header
+	-- Header: judul, timer, skor
 	UIStyle.CreateLabel({
 		Name = "Title",
-		Text = "🛵 Narik Ojol",
+		Text = "Narik Ojol 🛵",
 		Font = Fonts.Bold,
 		TextSize = UIStyle.TextSize.Title,
 		Size = UDim2.new(0.6, 0, 0, 28),
@@ -139,32 +148,50 @@ local function BuildUI()
 	})
 	UIStyle.CreateLabel({
 		Name = "Hint",
-		Text = "Ambil 🪙, hindari 🚧",
+		Text = "Ambil kuning, hindari merah!",
 		TextSize = UIStyle.TextSize.Caption,
 		TextColor3 = Colors.TextMuted,
 		TextXAlignment = Enum.TextXAlignment.Right,
-		Position = UDim2.fromScale(0.4, 0),
+		Position = UDim2.new(0.4, 0, 0, 34),
 		Size = UDim2.new(0.6, 0, 0, 22),
 		Parent = card,
-	}).Position = UDim2.new(0.4, 0, 0, 34)
+	})
 
-	-- Area game (3 jalur)
-	local area = UIStyle.CreateComponent("Frame", {
-		Name = "GameArea",
-		BackgroundColor3 = Colors.Track,
+	-- Holder: mengisi ruang tengah card; area game di dalamnya dijaga rasio 4:5 (maks 400x500)
+	local holder = UIStyle.CreateComponent("Frame", {
+		Name = "AreaHolder",
+		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		ClipsDescendants = true,
 		Position = UDim2.fromOffset(0, HEADER_HEIGHT),
 		Size = UDim2.new(1, 0, 1, -(HEADER_HEIGHT + CONTROL_HEIGHT + 12)),
-		Corner = UIStyle.RadiusSmall,
 		Parent = card,
+	})
+
+	-- Area game hitam, 3 jalur vertikal
+	local area = UIStyle.CreateComponent("Frame", {
+		Name = "GameArea",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1),
+		Corner = UIStyle.RadiusSmall,
+		Parent = holder,
+	}, {
+		UIStyle.CreateComponent("UIAspectRatioConstraint", {
+			AspectRatio = 0.8,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Width,
+		}),
+		UIStyle.CreateComponent("UISizeConstraint", { MaxSize = Vector2.new(400, 500) }),
 	})
 	for i = 1, LANE_COUNT - 1 do
 		UIStyle.CreateComponent("Frame", {
 			Name = "Divider" .. i,
 			AnchorPoint = Vector2.new(0.5, 0),
-			BackgroundColor3 = Colors.Card,
-			BackgroundTransparency = 0.2,
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BackgroundTransparency = 0.75,
 			BorderSizePixel = 0,
 			Position = UDim2.fromScale(i / LANE_COUNT, 0),
 			Size = UDim2.new(0, 2, 1, 0),
@@ -173,7 +200,7 @@ local function BuildUI()
 		})
 	end
 
-	-- Player (Frame biru)
+	-- Player: frame biru di jalur tengah bagian bawah
 	local playerFrame = UIStyle.CreateComponent("Frame", {
 		Name = "Player",
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -182,7 +209,7 @@ local function BuildUI()
 		Position = UDim2.fromScale(LaneX(2), PLAYER_Y),
 		Size = UDim2.fromOffset(48, 48),
 		ZIndex = 3,
-		Corner = 14,
+		Corner = 12,
 		Parent = area,
 	}, {
 		UIStyle.CreateLabel({
@@ -196,7 +223,7 @@ local function BuildUI()
 		}),
 	})
 
-	-- Label hasil (tampil saat waktu habis)
+	-- Label hasil (tampil saat game selesai)
 	local resultLabel = UIStyle.CreateLabel({
 		Name = "Result",
 		Text = "",
@@ -232,8 +259,8 @@ local function BuildUI()
 			Corner = PILL,
 		})
 	end
-	local leftButton  = CreateControlButton("◀", UDim2.fromScale(0, 0))
-	local rightButton = CreateControlButton("▶", UDim2.new(0.5, 6, 0, 0))
+	local leftButton  = CreateControlButton("⬅️", UDim2.fromScale(0, 0))
+	local rightButton = CreateControlButton("➡️", UDim2.new(0.5, 6, 0, 0))
 	UIStyle.CreateComponent("Frame", {
 		Name = "Controls",
 		BackgroundTransparency = 1,
@@ -255,23 +282,22 @@ local function BuildUI()
 	}
 end
 
+-- Obstacle = kotak merah, Coin = kotak kuning
 local function CreateEntity(area: Frame, kind: string, lane: number, cell: number)
 	local isCoin = kind == "Coin"
-	local icon = if isCoin then "🪙" else OBSTACLE_ICONS[math.random(1, #OBSTACLE_ICONS)]
-
 	local frame = UIStyle.CreateComponent("Frame", {
 		Name = kind,
 		AnchorPoint = Vector2.new(0.5, 0.5),
-		BackgroundColor3 = if isCoin then Colors.StatStress else Colors.Danger, -- kuning / merah
+		BackgroundColor3 = if isCoin then Colors.StatStress else Colors.Danger,
 		BorderSizePixel = 0,
 		Position = UDim2.fromScale(LaneX(lane), -0.1),
 		Size = UDim2.fromOffset(cell, cell),
 		ZIndex = 2,
-		Corner = if isCoin then PILL else 12,
+		Corner = if isCoin then PILL else 10,
 		Parent = area,
 	}, {
 		UIStyle.CreateLabel({
-			Text = icon,
+			Text = if isCoin then "🪙" else "🚧",
 			TextScaled = true,
 			TextXAlignment = Enum.TextXAlignment.Center,
 			Size = UDim2.fromScale(1, 1),
@@ -289,20 +315,24 @@ local function Run(ui)
 	local entities = {}
 	local connections = {}
 
-	local score = 0
+	local coins = 0
 	local targetLane = 2
 	local playerX = LaneX(2)
 	local spawnTimer = 0.4
-	local invulnUntil = 0
 	local lastCell = 0
 	local lastSecond = -1
 	local finished = false
+	local crashed = false
 	local startClock = os.clock()
 
 	local function MoveLane(direction: number)
+		if finished then
+			return
+		end
 		targetLane = math.clamp(targetLane + direction, 1, LANE_COUNT)
 	end
 
+	-- Putuskan SEMUA koneksi (input + loop) agar tidak bocor memori.
 	local function Disconnect()
 		for _, connection in ipairs(connections) do
 			connection:Disconnect()
@@ -310,29 +340,52 @@ local function Run(ui)
 		table.clear(connections)
 	end
 
-	local function Finish()
+	local function SetTimerText(secondsLeft: number)
+		ui.TimerLabel.Text = ("⏱ %ds"):format(secondsLeft)
+		ui.TimerLabel.TextColor3 = if secondsLeft <= 5 then Colors.Danger else Colors.TextDark
+	end
+
+	-- Dipanggil saat timer habis ATAU tabrakan.
+	local function Finish(didCrash: boolean)
 		if finished then
 			return
 		end
 		finished = true
-		Disconnect()
+		crashed = didCrash
+		Disconnect() -- loop berhenti, input dilepas
+
 		for _, entity in ipairs(entities) do
 			entity.Frame:Destroy()
 		end
 		table.clear(entities)
 
-		ui.ResultLabel.Text = "Menghitung hasil..."
+		local displayScore = coins * COIN_POINTS
+		ui.ResultLabel.TextColor3 = if didCrash then Colors.Danger else Colors.TextDark
+		ui.ResultLabel.Text = if didCrash
+			then ("💥 Tabrakan!\nSkor %d"):format(displayScore)
+			else "Menghitung hasil..."
 		ui.ResultLabel.Visible = true
-		ui.TimerLabel.Text = "⏱ 0s"
 
 		task.spawn(function()
+			-- Server menolak klaim yang datang sebelum durasi penuh (anti-cheat),
+			-- jadi jika tabrakan lebih awal, tunggu sisa waktu sebelum klaim.
+			while os.clock() - startClock < DURATION do
+				SetTimerText(math.max(0, math.ceil(DURATION - (os.clock() - startClock))))
+				task.wait(0.1)
+			end
+			SetTimerText(0)
+			ui.ResultLabel.Text = "Menghitung hasil..."
+			ui.ResultLabel.TextColor3 = Colors.TextDark
+
+			-- Server menghitung reward dari jumlah koin (skor tampilan = koin x 10).
 			local ok, success, reward, message = pcall(function()
-				return Network:InvokeServer("FinishMiniGame", GAME_TYPE, score)
+				return Network:InvokeServer("FinishMiniGame", GAME_TYPE, coins)
 			end)
 
 			local closeMessage = nil
 			if ok and success == true then
-				ui.ResultLabel.Text = ("Selesai! Skor %d\n+%s"):format(score, UIStyle.FormatRupiah(reward or 0))
+				local prefix = if crashed then "Tabrakan! " else "Selesai! "
+				ui.ResultLabel.Text = ("%sSkor %d\n+%s"):format(prefix, displayScore, UIStyle.FormatRupiah(reward or 0))
 				ui.ResultLabel.TextColor3 = Colors.TextMoney
 			else
 				closeMessage = if ok and type(message) == "string" then message else "Koneksi ke server bermasalah."
@@ -369,9 +422,10 @@ local function Run(ui)
 		end
 		local dt = math.min(dtRaw, 0.1) -- cegah lompatan saat lag
 		local now = os.clock()
-		local timeLeft = DURATION - (now - startClock)
+		local elapsed = now - startClock
+		local timeLeft = DURATION - elapsed
 		if timeLeft <= 0 then
-			Finish()
+			Finish(false)
 			return
 		end
 
@@ -379,8 +433,7 @@ local function Run(ui)
 		local secondsLeft = math.ceil(timeLeft)
 		if secondsLeft ~= lastSecond then
 			lastSecond = secondsLeft
-			ui.TimerLabel.Text = ("⏱ %ds"):format(secondsLeft)
-			ui.TimerLabel.TextColor3 = if secondsLeft <= 5 then Colors.Danger else Colors.TextDark
+			SetTimerText(secondsLeft)
 		end
 
 		local areaSize = area.AbsoluteSize
@@ -402,35 +455,33 @@ local function Run(ui)
 		playerX += (LaneX(targetLane) - playerX) * math.min(1, dt * LANE_LERP)
 		ui.Player.Position = UDim2.fromScale(playerX, PLAYER_Y)
 
-		local invulnerable = now < invulnUntil
-		ui.Player.BackgroundTransparency = if invulnerable and (math.floor(now * 10) % 2 == 0) then 0.6 else 0
-		ui.ScoreLabel.TextColor3 = if invulnerable then Colors.Danger else Colors.TextDark
+		-- Kecepatan jatuh & laju spawn naik seiring waktu
+		local fallSpeed = math.min(MAX_FALL_SPEED, BASE_FALL_SPEED + FALL_ACCEL * elapsed)
+		local spawnInterval = math.max(MIN_SPAWN, BASE_SPAWN - 0.02 * elapsed)
 
-		-- Spawn (satu entity per tick -> tidak pernah menutup ketiga jalur)
+		-- Spawn (satu entity per tick -> tidak pernah menutup ketiga jalur sekaligus)
 		spawnTimer -= dt
 		if spawnTimer <= 0 then
-			spawnTimer += SPAWN_INTERVAL
+			spawnTimer += spawnInterval
 			local kind = if math.random() < OBSTACLE_CHANCE then "Obstacle" else "Coin"
 			table.insert(entities, CreateEntity(area, kind, math.random(1, LANE_COUNT), cell))
 		end
 
 		-- Gerak + tabrakan
 		local hitRadius = (cell * 0.85) / areaSize.Y
+		local crashNow = false
 		for i = #entities, 1, -1 do
 			local entity = entities[i]
-			entity.Y += FALL_SPEED * dt
+			entity.Y += fallSpeed * dt
 			entity.Frame.Position = UDim2.fromScale(LaneX(entity.Lane), entity.Y)
 
 			local remove = entity.Y > 1.15
 			if not remove and entity.Lane == targetLane and math.abs(entity.Y - PLAYER_Y) < hitRadius then
 				if entity.Kind == "Coin" then
-					score += 1
+					coins += 1
 					remove = true
-				elseif not invulnerable then
-					score = math.max(0, score - HIT_PENALTY)
-					invulnUntil = now + INVULN_TIME
-					invulnerable = true
-					remove = true
+				else
+					crashNow = true -- tabrakan -> game langsung berakhir
 				end
 			end
 
@@ -439,7 +490,12 @@ local function Run(ui)
 				table.remove(entities, i)
 			end
 		end
-		ui.ScoreLabel.Text = "🪙 " .. score
+
+		ui.ScoreLabel.Text = "🪙 " .. (coins * COIN_POINTS)
+
+		if crashNow then
+			Finish(true)
+		end
 	end))
 end
 
