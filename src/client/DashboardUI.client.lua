@@ -32,6 +32,14 @@ local PILL               = UDim.new(0.5, 0)
 local FILL_TWEEN         = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local HOVER_TWEEN        = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
+-- Anti-stuck & loading
+local NEXT_WEEK_TIMEOUT   = 15 -- detik; batas tunggu InvokeServer("NextWeek")
+local GETDATA_TIMEOUT     = 6  -- detik; batas tunggu InvokeServer("GetData")
+local WATCHDOG_NEXT_WEEK  = 25 -- detik; paksa reset tombol jika masih busy
+local WATCHDOG_MINIGAME   = 45 -- detik; mini-game 15 detik + hasil + toleransi
+local LOAD_ATTEMPTS       = 6  -- percobaan GetData saat server masih memuat
+local LOAD_RETRY_DELAY    = 2  -- detik antar percobaan
+
 local camera = workspace.CurrentCamera
 while not camera do
 	task.wait()
@@ -53,6 +61,30 @@ end
 local miniGameOpen   = GetBindable("MiniGameOpen")
 local miniGameClosed = GetBindable("MiniGameClosed")
 
+-- InvokeServer yang tidak pernah menggantung: pcall + timeout.
+-- Mengembalikan (false, pesanError) jika error/timeout, atau (true, ...hasil server).
+local function SafeInvoke(timeout: number, remoteName: string, ...)
+	local args = table.pack(...)
+	local done = false
+	local results = nil
+
+	task.spawn(function()
+		results = table.pack(pcall(function()
+			return Network:InvokeServer(remoteName, table.unpack(args, 1, args.n))
+		end))
+		done = true
+	end)
+
+	local startClock = os.clock()
+	while not done and (os.clock() - startClock) < timeout do
+		task.wait(0.05)
+	end
+	if not done or not results then
+		return false, "timeout"
+	end
+	return table.unpack(results, 1, results.n)
+end
+
 -- Area atas yang dipakai tombol bawaan Roblox (IgnoreGuiInset = true membuat UI kita menimpanya).
 local function GetTopInset(): number
 	local inset = GuiService:GetGuiInset().Y
@@ -65,6 +97,9 @@ local function GetTopInset(): number
 	end
 	return value
 end
+
+-- Referensi komponen UI untuk update data. nil sampai semua komponen selesai dibangun.
+local ui = nil
 
 -- ===== ScreenGui + Background gradient =====
 local screenGui = UIStyle.CreateComponent("ScreenGui", {
@@ -208,6 +243,9 @@ local function CreateStatRow(def, order)
 
 	local currentTween = nil
 	local function SetValue(value: number, animate: boolean?)
+		if type(value) ~= "number" or value ~= value then
+			value = 0 -- nil / NaN -> aman
+		end
 		valueLabel.Text = def.Format(value)
 		valueLabel.TextColor3 = if value < 0 then Colors.Danger else Colors.TextDark
 
@@ -313,10 +351,14 @@ logScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
 end)
 
 local function AddLogEntry(entry)
+	if type(entry) ~= "table" then
+		return
+	end
+
 	-- Dedupe: riwayat dari GetData bisa tumpang tindih dengan event LogAdded yang datang lebih dulu.
 	local key = nil
 	if entry.Time then
-		key = ("%d|%s|%s"):format(entry.Time, tostring(entry.Week), tostring(entry.Text))
+		key = ("%s|%s|%s"):format(tostring(entry.Time), tostring(entry.Week), tostring(entry.Text))
 		if logSeen[key] then
 			return
 		end
@@ -335,7 +377,7 @@ local function AddLogEntry(entry)
 	}, {
 		UIStyle.CreateLabel({
 			Name = "Icon",
-			Text = entry.Icon or "📝",
+			Text = tostring(entry.Icon or "📝"),
 			TextSize = 20,
 			TextXAlignment = Enum.TextXAlignment.Center,
 			Position = UDim2.fromOffset(8, 0),
@@ -466,12 +508,15 @@ local careerValue    = CreateInfoRow("💼", "Karir", 3)
 local inventoryValue = CreateInfoRow("🎒", "Inventory", 4)
 
 local function SetDebt(amount: number)
+	if type(amount) ~= "number" or amount ~= amount then
+		amount = 0
+	end
 	debtValue.Text = if amount > 0 then UIStyle.FormatRupiah(amount) else "Bebas utang"
 	debtValue.TextColor3 = if amount > 0 then Colors.Danger else Colors.TextMoney
 end
 
 -- Tombol NEXT WEEK: pill hitam, hover biru
-local nextButton = UIStyle.CreateComponent("TextButton", {
+local nextBtn = UIStyle.CreateComponent("TextButton", {
 	Name = "NextWeekButton",
 	Text = NEXT_TEXT,
 	Font = Fonts.Bold,
@@ -487,7 +532,7 @@ local nextButton = UIStyle.CreateComponent("TextButton", {
 })
 
 -- Tombol Kerja: pill hijau (teks gelap agar kontras), abu saat sibuk
-local workButton = UIStyle.CreateComponent("TextButton", {
+local workBtn = UIStyle.CreateComponent("TextButton", {
 	Name = "WorkOjolButton",
 	Text = WORK_TEXT,
 	Font = Fonts.Bold,
@@ -503,26 +548,27 @@ local workButton = UIStyle.CreateComponent("TextButton", {
 })
 
 local serverBusy = false -- dari GameStateChanged
-local localBusy = false  -- selama InvokeServer / mini-game berjalan
+local localBusy = false  -- selama invoke / mini-game berjalan
 local hovering = false
 local workHovering = false
+local busyToken = 0      -- penanda watchdog; naik setiap Arm/Reset sehingga watchdog lama batal
 
 local function UpdateButtons()
 	local busy = serverBusy or localBusy
 
 	-- Next Week
-	nextButton.Active = not busy
-	nextButton.Text = if busy then "WAIT..." else NEXT_TEXT
+	nextBtn.Active = not busy
+	nextBtn.Text = if busy then "WAIT..." else NEXT_TEXT
 	local nextTarget = Colors.ButtonBlack
 	if busy then
 		nextTarget = Colors.ButtonDisabled
 	elseif hovering then
 		nextTarget = Colors.Info
 	end
-	TweenService:Create(nextButton, HOVER_TWEEN, { BackgroundColor3 = nextTarget }):Play()
+	TweenService:Create(nextBtn, HOVER_TWEEN, { BackgroundColor3 = nextTarget }):Play()
 
 	-- Kerja
-	workButton.Active = not busy
+	workBtn.Active = not busy
 	local workColor = Colors.Primary
 	local workText = Colors.TextDark
 	if busy then
@@ -532,22 +578,45 @@ local function UpdateButtons()
 		workColor = Colors.Info
 		workText = Colors.TextLight
 	end
-	TweenService:Create(workButton, HOVER_TWEEN, { BackgroundColor3 = workColor, TextColor3 = workText }):Play()
+	TweenService:Create(workBtn, HOVER_TWEEN, { BackgroundColor3 = workColor, TextColor3 = workText }):Play()
 end
 
-nextButton.MouseEnter:Connect(function()
+-- Reset paksa: tombol SELALU kembali normal (dipanggil setelah invoke selesai, sukses maupun gagal).
+local function ResetButtons()
+	busyToken += 1
+	localBusy = false
+	serverBusy = false
+	nextBtn.Text = NEXT_TEXT
+	nextBtn.Active = true
+	workBtn.Active = true
+	UpdateButtons()
+end
+
+-- Watchdog: jika masih busy setelah `seconds` dan tidak ada Arm/Reset baru, paksa reset.
+local function ArmWatchdog(seconds: number)
+	busyToken += 1
+	local token = busyToken
+	task.delay(seconds, function()
+		if token == busyToken and (localBusy or serverBusy) then
+			warn("[DashboardUI] Watchdog: tombol macet, direset paksa.")
+			ResetButtons()
+		end
+	end)
+end
+
+nextBtn.MouseEnter:Connect(function()
 	hovering = true
 	UpdateButtons()
 end)
-nextButton.MouseLeave:Connect(function()
+nextBtn.MouseLeave:Connect(function()
 	hovering = false
 	UpdateButtons()
 end)
-workButton.MouseEnter:Connect(function()
+workBtn.MouseEnter:Connect(function()
 	workHovering = true
 	UpdateButtons()
 end)
-workButton.MouseLeave:Connect(function()
+workBtn.MouseLeave:Connect(function()
 	workHovering = false
 	UpdateButtons()
 end)
@@ -565,7 +634,7 @@ local function Relayout()
 	rootPadding.PaddingTop = UDim.new(0, math.max(pad, GetTopInset() + 8))
 
 	if compact then
-		-- HP portrait: tiga card ditumpuk vertikal (total tinggi = 100% - 3x16 + 2x24 gap = pas)
+		-- HP portrait: tiga card ditumpuk vertikal
 		rootLayout.FillDirection = Enum.FillDirection.Vertical
 		leftWrapper.Size = UDim2.new(1, 0, 0.30, -16)
 		midWrapper.Size = UDim2.new(1, 0, 0.36, -16)
@@ -585,21 +654,57 @@ pcall(function()
 end)
 Relayout()
 
--- ===== Data dari server =====
+-- Semua komponen sudah ada -> `ui` siap dipakai.
+ui = { StatSetters = statSetters }
+
+-- ===== Data dari server (semua tahan nil / data tidak lengkap) =====
 local function ApplyProfile(data)
-	ageLabel.Text = ("Umur %d • Minggu %d"):format(data.Age, data.Week)
-	stageValue.Text = tostring(data.LifeStage)
-	SetDebt(data.Stats.Debt or 0)
+	if not ui or type(data) ~= "table" then
+		return
+	end
+	local stats = if type(data.Stats) == "table" then data.Stats else {}
+	local age = math.floor(tonumber(data.Age) or 0)
+	local week = math.floor(tonumber(data.Week) or 0)
+
+	ageLabel.Text = ("Umur %d • Minggu %d"):format(age, week)
+	stageValue.Text = tostring(data.LifeStage or "-")
+	SetDebt(tonumber(stats.Debt) or 0)
 	careerValue.Text = if type(data.Career) == "string" then data.Career else "Belum ada"
 	local itemCount = if type(data.Inventory) == "table" then #data.Inventory else 0
 	inventoryValue.Text = if itemCount > 0 then ("%d item"):format(itemCount) else "Kosong"
 end
 
+-- Fallback: ui nil / data nil / Stats tidak lengkap -> berhenti tanpa crash.
+local function UpdateStatUI(data)
+	if not ui then
+		return
+	end
+	if type(data) ~= "table" or type(data.Stats) ~= "table" then
+		return
+	end
+	for statName, setter in pairs(ui.StatSetters) do
+		local value = data.Stats[statName]
+		if type(value) ~= "number" then
+			value = 0
+		end
+		setter(value, false)
+	end
+	ApplyProfile(data)
+end
+
+local function AddHistory(data)
+	if type(data) ~= "table" or type(data.Log) ~= "table" then
+		return
+	end
+	for _, entry in ipairs(data.Log) do
+		AddLogEntry(entry)
+	end
+end
+
+-- Dipanggil setelah NEXT WEEK. Placeholder "Loading" diabaikan agar profil tidak ter-reset ke 0.
 local function RefreshProfile()
-	local ok, data = pcall(function()
-		return Network:InvokeServer("GetData")
-	end)
-	if ok and data then
+	local ok, data = SafeInvoke(GETDATA_TIMEOUT, "GetData")
+	if ok and type(data) == "table" and data.Loading ~= true then
 		ApplyProfile(data)
 	else
 		warn("[DashboardUI] Gagal refresh profil:", data)
@@ -608,7 +713,10 @@ end
 
 -- Listener dipasang SEBELUM GetData supaya tidak ada event yang terlewat.
 Network:OnClientEvent("StatChanged", function(statName, newValue)
-	local setter = statSetters[statName]
+	if not ui then
+		return
+	end
+	local setter = ui.StatSetters[statName]
 	if setter then
 		setter(newValue, true)
 	end
@@ -623,69 +731,91 @@ end)
 
 Network:OnClientEvent("GameStateChanged", function(state)
 	serverBusy = (state ~= GameState.State.IDLE)
+	if serverBusy then
+		ArmWatchdog(WATCHDOG_MINIGAME) -- state busy tidak boleh bertahan selamanya di client
+	end
 	UpdateButtons()
 end)
 
-nextButton.Activated:Connect(function()
+-- NEXT WEEK: invoke aman (pcall + timeout) di task.spawn, tombol SELALU di-reset di akhir.
+nextBtn.Activated:Connect(function()
 	if serverBusy or localBusy then
 		return
 	end
 	localBusy = true
 	UpdateButtons()
+	ArmWatchdog(WATCHDOG_NEXT_WEEK)
 
-	local ok, success, message = pcall(function()
-		return Network:InvokeServer("NextWeek")
+	task.spawn(function()
+		local bodyOk, bodyErr = pcall(function()
+			local ok, success, message = SafeInvoke(NEXT_WEEK_TIMEOUT, "NextWeek")
+			if not ok then
+				warn("[DashboardUI] NextWeek error:", success)
+				AddLogEntry({ Text = "Koneksi ke server bermasalah, coba lagi.", Type = "Bahaya", Icon = "⚠️" })
+			elseif success == false then
+				AddLogEntry({ Text = tostring(message or "Tidak bisa lanjut minggu sekarang."), Type = "Bahaya", Icon = "⚠️" })
+			end
+
+			-- Server belum mengirim event umur -> sinkronkan via GetData setelah minggu selesai.
+			RefreshProfile()
+		end)
+		if not bodyOk then
+			warn("[DashboardUI] Handler NextWeek crash:", bodyErr)
+		end
+
+		ResetButtons() -- selalu jalan: teks kembali "NEXT WEEK ▶", Active = true
 	end)
-	if not ok then
-		warn("[DashboardUI] NextWeek error:", success)
-		AddLogEntry({ Text = "Koneksi ke server bermasalah, coba lagi.", Type = "Bahaya", Icon = "⚠️" })
-	elseif success == false then
-		AddLogEntry({ Text = message or "Tidak bisa lanjut minggu sekarang.", Type = "Bahaya", Icon = "⚠️" })
-	end
-
-	-- Server belum mengirim event umur -> sinkronkan via GetData setelah minggu selesai.
-	RefreshProfile()
-
-	localBusy = false
-	UpdateButtons()
 end)
 
 -- Tombol Kerja -> minta OjolRunner membuka mini-game
-workButton.Activated:Connect(function()
+workBtn.Activated:Connect(function()
 	if serverBusy or localBusy then
 		return
 	end
 	localBusy = true -- mengunci kedua tombol sampai mini-game ditutup
 	UpdateButtons()
+	ArmWatchdog(WATCHDOG_MINIGAME)
 	miniGameOpen:Fire("Ojol")
 end)
 
 -- Mini-game ditutup (selesai normal atau gagal mulai)
 miniGameClosed.Event:Connect(function(errorMessage)
-	localBusy = false
-	UpdateButtons()
+	ResetButtons()
 	if errorMessage then
 		AddLogEntry({ Text = tostring(errorMessage), Type = "Bahaya", Icon = "⚠️" })
 	end
 end)
 
--- Muat data awal
+-- Muat data awal: retry selama server masih memuat (placeholder Loading), tidak pernah crash.
 task.spawn(function()
-	local ok, data = pcall(function()
-		return Network:InvokeServer("GetData")
-	end)
-	if not ok or not data then
-		warn("[DashboardUI] Gagal memuat data awal:", data)
-		AddLogEntry({ Text = "Gagal memuat data. Coba rejoin.", Type = "Bahaya", Icon = "⚠️" })
-		return
+	local loaded = false
+	local notifiedLoading = false
+
+	for attempt = 1, LOAD_ATTEMPTS do
+		local ok, data = SafeInvoke(GETDATA_TIMEOUT, "GetData")
+		if ok and type(data) == "table" then
+			if data.Loading == true then
+				if not notifiedLoading then
+					notifiedLoading = true
+					AddLogEntry({ Text = "Memuat data, mohon tunggu...", Type = "Info", Icon = "⏳" })
+				end
+			else
+				UpdateStatUI(data)
+				AddHistory(data)
+				loaded = true
+				break
+			end
+		else
+			warn("[DashboardUI] GetData gagal:", data)
+		end
+
+		if attempt < LOAD_ATTEMPTS then
+			task.wait(LOAD_RETRY_DELAY)
+		end
 	end
 
-	for statName, setter in pairs(statSetters) do
-		setter(data.Stats[statName] or 0, false)
-	end
-	ApplyProfile(data)
-	for _, entry in ipairs(data.Log) do
-		AddLogEntry(entry)
+	if not loaded then
+		AddLogEntry({ Text = "Gagal memuat data. Coba rejoin.", Type = "Bahaya", Icon = "⚠️" })
 	end
 end)
 
