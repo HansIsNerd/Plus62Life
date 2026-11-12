@@ -1,9 +1,11 @@
 --!nonstrict
-local Config      = require(game.ReplicatedStorage.Shared.Config)
-local Network     = require(game.ReplicatedStorage.Shared.Network)
-local DataManager = require(script.Parent.DataManager)
-local StatSystem  = require(script.Parent.StatSystem)
-local LogSystem   = require(script.Parent.LogSystem)
+-- src/server/Modules/TimeSystem.lua
+local Config          = require(game.ReplicatedStorage.Shared.Config)
+local Network         = require(game.ReplicatedStorage.Shared.Network)
+local DataManager     = require(script.Parent.DataManager)
+local StatSystem      = require(script.Parent.StatSystem)
+local LogSystem       = require(script.Parent.LogSystem)
+local LifeStageModule = require(script.Parent.LifeStageModule)
 
 local TimeSystem = {}
 
@@ -18,8 +20,9 @@ function TimeSystem:AdvanceWeek(player)
     if ageWeeks == 0 then
         data.Age += 1
         LogSystem:Add(player, ("Selamat ulang tahun! Kamu sekarang berumur %d tahun."):format(data.Age), "Success", "🎂")
-        
-        -- (Nanti di Fase 3: Update LifeStage di sini)
+
+        -- Fase 3: cek apakah umur baru membuat pemain pindah life stage
+        LifeStageModule:CheckStage(player, data.Age)
     end
 
     -- 2. Simulasi 4 Fase Mingguan

@@ -1,4 +1,5 @@
 --!nonstrict
+-- src/server/Main.server.lua
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -6,6 +7,7 @@ local Modules         = script.Parent.Modules
 local Network         = require(ReplicatedStorage.Shared.Network)
 local DataManager     = require(Modules.DataManager)
 local TimeSystem      = require(Modules.TimeSystem)
+local BirthModule     = require(Modules.BirthModule)
 local GameState       = require(ReplicatedStorage.Shared.GameState)
 
 DataManager:Init()
@@ -47,6 +49,17 @@ Players.PlayerAdded:Connect(function(player)
     local data = DataManager:Load(player)
     if not data then player:Kick("Gagal memuat data."); return end
     print(("[Server] Loaded %s | Stage=%s | Age=%d"):format(player.Name, data.LifeStage, data.Age))
+
+    -- Fase 3: pemain baru (Week == 0) -> RNG kelahiran.
+    -- BirthModule punya flag BirthRolled, jadi keluar-masuk sebelum minggu pertama tidak bisa reroll.
+    if data.Week == 0 then
+        local ok, err = pcall(function()
+            BirthModule:RollBirth(player)
+        end)
+        if not ok then
+            warn(("[Server] RollBirth gagal untuk %s: %s"):format(player.Name, tostring(err)))
+        end
+    end
 end)
 
 Players.PlayerRemoving:Connect(function(player)
